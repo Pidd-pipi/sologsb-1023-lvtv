@@ -208,6 +208,56 @@ textarea {
   background: #f7f8fa;
 }
 
+.confirm-card {
+  padding: 9px 10px;
+  border: 1px solid #e5e6eb;
+  border-left-width: 3px;
+  border-radius: 7px;
+  background: #fff;
+}
+
+.confirm-card.confirm-active {
+  border-left-color: #00b42a;
+  background: #f6ffed;
+}
+
+.confirm-card.confirm-stale {
+  border-left-color: #ff7d00;
+  background: #fff7e8;
+}
+
+.confirm-card.confirm-void {
+  border-left-color: #c9cdd4;
+  background: #f7f8fa;
+  opacity: 0.85;
+}
+
+.confirm-batch-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  border: 1px solid #e5e6eb;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.5;
+  background: #f7f8fa;
+}
+
+.confirm-batch-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  font-family: "Songti SC", "Noto Serif SC", serif;
+  color: #4e5969;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.confirm-batch-arrow {
+  color: #86909c;
+}
+
 @media (max-width: 1100px) {
   .main-layout {
     display: block !important;
