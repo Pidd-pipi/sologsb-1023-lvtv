@@ -3,13 +3,17 @@ import { sampleVersions, splitIntoUnits } from '../data';
 import type {
   AlignmentRow,
   ComparisonRules,
+  ConfirmationRecord,
+  ConfirmationState,
   DifferenceStatus,
   PersistedCollationState,
+  ReviewReason,
   TextUnit,
   VersionDocument
 } from '../types';
 
-const STORAGE_KEY = 'sologsb-1023/multi-version-collation/v1';
+const STORAGE_KEY = 'sologsb-1023/multi-version-collation/v2';
+const EDITOR_STORAGE_KEY = 'sologsb-1023/multi-version-collation/editor';
 
 const variantMap: Record<string, string> = {
   為: '为',
@@ -21,7 +25,7 @@ const variantMap: Record<string, string> = {
   鄰: '邻',
   儼: '俨',
   渙: '涣',
-  將: '将',
+ 將: '将',
   樸: '朴',
   曠: '旷',
   濁: '浊',
@@ -42,6 +46,10 @@ function yieldToBrowser() {
   return new Promise<void>((resolve) => {
     window.setTimeout(resolve, 0);
   });
+}
+
+function uid(prefix: string) {
+  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
 function normalized(value: string, rules: ComparisonRules) {
@@ -116,23 +124,23 @@ async function alignUnits(
       if (sameParagraph && (ratio >= 0.28 || (nextLeftRatio < 0.58 && nextRightRatio < 0.58))) {
         const score = Number(ratio.toFixed(3));
         rows.push({
-          id: `row-${rows.length + 1}-${left.id}-${right.id}`,
+          id: uid('row'),
           left,
           right,
           status: statusFor(left, right, score),
           similarity: score,
           note: '',
+          basis: '',
           source: '',
-          accepted: score > 0.995,
           manuallyAdjusted: false
         });
         leftIndex += 1;
         rightIndex += 1;
       } else if (nextRightRatio > ratio && nextRightRatio > nextLeftRatio) {
-        rows.push(makeRow(undefined, right, rules, '右侧有段落或句子插入'));
+        rows.push(makeRow(undefined, right, rules, '自动标记右侧插入内容'));
         rightIndex += 1;
       } else {
-        rows.push(makeRow(left, undefined, rules, '左侧有段落或句子缺失'));
+        rows.push(makeRow(left, undefined, rules, '自动标记左侧缺失内容'));
         leftIndex += 1;
       }
     }
@@ -154,20 +162,25 @@ function makeRow(
 ): AlignmentRow {
   const score = left && right ? Number(similarity(normalized(left.text, rules), normalized(right.text, rules)).toFixed(3)) : 0;
   return {
-    id: `row-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+    id: uid('row'),
     left,
     right,
     status: statusFor(left, right, score),
     similarity: score,
     note: '',
+    basis: '',
     source,
-    accepted: score > 0.995,
     manuallyAdjusted: false
   };
 }
 
 function defaultRules(): ComparisonRules {
   return { ignorePunctuation: true, ignoreVariants: true, candidateWindow: 3 };
+}
+
+/** 以句段 id 配对为键，在重新对齐后把确认档案带到新行 */
+function pairingKey(left?: TextUnit, right?: TextUnit) {
+  return `${left?.id ?? '∅'}|${right?.id ?? '∅'}`;
 }
 
 export function useCollation() {
@@ -177,10 +190,14 @@ export function useCollation() {
   const rows = ref<AlignmentRow[]>([]);
   const rules = ref<ComparisonRules>(defaultRules());
   const selectedRowId = ref('');
-  const selectedRowIds = ref<(string | number)[]>([]);
   const processing = ref(false);
   const progress = ref(0);
   const message = ref('正在载入本地校勘数据…');
+  const editorName = ref('');
+  /** rowId -> 该条配对行历次确认档案，最后一条是当前有效/待复核档案 */
+  const confirmations = ref<Record<string, ConfirmationRecord[]>>({});
+  /** 重新对齐后失去配对行的确认档案，仍随数据导出 */
+  const archivedConfirmations = ref<ConfirmationRecord[]>([]);
   const history = ref<string[]>([]);
   const future = ref<string[]>([]);
   const canUndo = computed(() => history.value.length > 0);
@@ -189,23 +206,49 @@ export function useCollation() {
   const rightVersion = computed(() => versions.value.find((item) => item.id === rightVersionId.value));
   const selectedRow = computed(() => rows.value.find((item) => item.id === selectedRowId.value));
   const differenceCount = computed(() => rows.value.filter((row) => row.status !== 'same').length);
-  const acceptedCount = computed(() => rows.value.filter((row) => row.accepted).length);
-  const unresolvedCount = computed(() => rows.value.filter((row) => !row.accepted && row.status !== 'same').length);
+
+  const activeConfirmation = (rowId: string) => {
+    const list = confirmations.value[rowId];
+    return list && list.length ? list[list.length - 1] : undefined;
+  };
+
+  const confirmationState = (rowId: string): ConfirmationState | undefined => activeConfirmation(rowId)?.state;
+
+  const validCount = computed(
+    () => rows.value.filter((row) => activeConfirmation(row.id)?.state === 'valid').length
+  );
+  const reviewCount = computed(
+    () => rows.value.filter((row) => activeConfirmation(row.id)?.state === 'review').length
+  );
+  /** 待处理：有差异且尚无有效确认 */
+  const unresolvedCount = computed(
+    () =>
+      rows.value.filter((row) => {
+        if (row.status === 'same') return false;
+        const state = activeConfirmation(row.id)?.state;
+        return state !== 'valid';
+      }).length
+  );
 
   function snapshot(): string {
     const data: PersistedCollationState = {
+      version: 2,
       versions: versions.value,
       leftVersionId: leftVersionId.value,
       rightVersionId: rightVersionId.value,
       rows: rows.value,
       rules: rules.value,
-      selectedRowId: selectedRowId.value
+      selectedRowId: selectedRowId.value,
+      editorName: editorName.value,
+      confirmations: confirmations.value,
+      archivedConfirmations: archivedConfirmations.value
     };
     return JSON.stringify(data);
   }
 
   function persist() {
     localStorage.setItem(STORAGE_KEY, snapshot());
+    localStorage.setItem(EDITOR_STORAGE_KEY, editorName.value);
   }
 
   function commit(label: string, mutate: () => void) {
@@ -213,6 +256,7 @@ export function useCollation() {
     if (history.value.length > 50) history.value.shift();
     future.value = [];
     mutate();
+    refreshConfirmationStates();
     message.value = label;
     persist();
   }
@@ -222,9 +266,25 @@ export function useCollation() {
     versions.value = parsed.versions;
     leftVersionId.value = parsed.leftVersionId;
     rightVersionId.value = parsed.rightVersionId;
-    rows.value = parsed.rows;
-    rules.value = parsed.rules;
-    selectedRowId.value = parsed.selectedRowId;
+    rules.value = parsed.rules ?? defaultRules();
+    rows.value = (parsed.rows ?? []).map((row) =>
+      row.basis === undefined ? { ...row, basis: '' } : row
+    );
+    selectedRowId.value = parsed.selectedRowId ?? '';
+    editorName.value = parsed.editorName ?? localStorage.getItem(EDITOR_STORAGE_KEY) ?? '';
+    if (parsed.version === 2) {
+      confirmations.value = parsed.confirmations ?? {};
+      archivedConfirmations.value = parsed.archivedConfirmations ?? [];
+    } else {
+      // v1：旧 accepted 标记迁移成确认档案，处理人与依据待补录，先按现场判定状态
+      const migrated = migrateLegacyConfirmations(rows.value, rules.value);
+      confirmations.value = migrated;
+      archivedConfirmations.value = [];
+    }
+    rows.value.forEach((row) => {
+      delete (row as Partial<AlignmentRow> & { accepted?: boolean }).accepted;
+    });
+    refreshConfirmationStates();
     persist();
   }
 
@@ -244,6 +304,86 @@ export function useCollation() {
     message.value = '已重做上一步操作';
   }
 
+  /** v1 的 accepted:true 迁移成待补录的确认档案 */
+  function migrateLegacyConfirmations(
+    targetRows: AlignmentRow[],
+    currentRules: ComparisonRules
+  ): Record<string, ConfirmationRecord[]> {
+    const map: Record<string, ConfirmationRecord[]> = {};
+    targetRows.forEach((row) => {
+      if (!row.accepted) return;
+      map[row.id] = [
+        {
+          id: uid('confirm'),
+          rowId: row.id,
+          editor: '',
+          basis: '',
+          confirmedAt: new Date(0).toISOString(),
+          leftSnapshot: { unitId: row.left?.id, text: row.left?.text ?? '' },
+          rightSnapshot: { unitId: row.right?.id, text: row.right?.text ?? '' },
+          statusSnapshot: row.status,
+          rulesSnapshot: { ...currentRules },
+          noteSnapshot: row.note,
+          sourceSnapshot: row.source,
+          state: 'review',
+          reviewReasons: [],
+          migrated: true
+        }
+      ];
+    });
+    return map;
+  }
+
+  /** 现场与确认快照比对：两侧正文、配对、规则、校记任一变化即进入待复核 */
+  function reviewReasonsFor(row: AlignmentRow, record: ConfirmationRecord): ReviewReason[] {
+    const reasons = new Set<ReviewReason>();
+    if (record.migrated) reasons.add('manual');
+    if (row.left?.id !== record.leftSnapshot.unitId || (row.left?.text ?? '') !== record.leftSnapshot.text) {
+      reasons.add('text');
+    }
+    if (row.right?.id !== record.rightSnapshot.unitId || (row.right?.text ?? '') !== record.rightSnapshot.text) {
+      reasons.add('text');
+    }
+    if (
+      rules.value.ignorePunctuation !== record.rulesSnapshot.ignorePunctuation ||
+      rules.value.ignoreVariants !== record.rulesSnapshot.ignoreVariants
+    ) {
+      reasons.add('rules');
+    }
+    if (
+      row.note !== record.noteSnapshot ||
+      row.source !== record.sourceSnapshot ||
+      row.basis !== record.basis
+    ) {
+      reasons.add('annotation');
+    }
+    if (row.status !== record.statusSnapshot) {
+      reasons.add('judgment');
+    }
+    return [...reasons];
+  }
+
+  /** 不改动档案内容，只按当前现场重算 valid / review 状态；旧记录原样保留 */
+  function refreshConfirmationStates(changedRowIds?: Set<string>) {
+    rows.value.forEach((row) => {
+      const list = confirmations.value[row.id];
+      if (!list || !list.length) return;
+      const record = list[list.length - 1];
+      if (record.state === 'invalidated') return;
+      if (changedRowIds && !changedRowIds.has(row.id)) return;
+      const reasons = reviewReasonsFor(row, record);
+      if (reasons.length === 0 && record.state !== 'valid') {
+        record.state = 'valid';
+        record.reviewReasons = [];
+        record.reviewedAt = undefined;
+      } else if (reasons.length > 0) {
+        record.state = 'review';
+        record.reviewReasons = reasons;
+        record.reviewedAt ??= new Date().toISOString();
+      }
+    });
+  }
+
   async function runAlignment(commitHistory = true) {
     if (!leftVersion.value || !rightVersion.value || processing.value) return;
     processing.value = true;
@@ -254,42 +394,85 @@ export function useCollation() {
       const result = await alignUnits(leftVersion.value.units, rightVersion.value.units, rules.value, (value) => {
         progress.value = value;
       });
+      carryOverConfirmations(result);
       if (commitHistory) {
         history.value.push(previous);
         future.value = [];
       }
       rows.value = result;
       selectedRowId.value = result.find((row) => row.status !== 'same')?.id ?? result[0]?.id ?? '';
-      selectedRowIds.value = [];
-      message.value = `自动对齐完成：${result.filter((row) => row.status !== 'same').length} 处差异`;
+      refreshConfirmationStates();
+      message.value = `自动对齐完成：${result.filter((row) => row.status !== 'same').length} 处差异，确认档案已按配对续接`;
       persist();
     } finally {
       processing.value = false;
     }
   }
 
+  /** 重新对齐：同一对句段的档案带到新行并按新现场复核，其余（含失效档案）归档留痕 */
+  function carryOverConfirmations(newRows: AlignmentRow[]) {
+    const byKey = new Map<string, AlignmentRow>();
+    newRows.forEach((row) => byKey.set(pairingKey(row.left, row.right), row));
+    const archive: ConfirmationRecord[] = [...archivedConfirmations.value];
+    const next: Record<string, ConfirmationRecord[]> = {};
+
+    Object.entries(confirmations.value).forEach(([oldRowId, list]) => {
+      const latest = list[list.length - 1];
+      if (!latest) return;
+      const key = `${latest.leftSnapshot.unitId ?? '∅'}|${latest.rightSnapshot.unitId ?? '∅'}`;
+      const target = latest.state !== 'invalidated' ? byKey.get(key) : undefined;
+      if (target) {
+        next[target.id] = list.map((item) =>
+          item.state === 'invalidated' ? item : { ...item, rowId: target.id }
+        );
+      } else {
+        archive.push(
+          ...list.map((item) =>
+            item.state === 'invalidated'
+              ? item
+              : {
+                  ...item,
+                  rowId: oldRowId,
+                  state: 'review' as const,
+                  reviewReasons: Array.from(new Set([...item.reviewReasons, 'superseded' as ReviewReason])),
+                  reviewedAt: item.reviewedAt ?? new Date().toISOString()
+                }
+          )
+        );
+      }
+    });
+    confirmations.value = next;
+    archivedConfirmations.value = archive;
+  }
+
   function recalculate() {
-    commit('已按比较规则重算差异', () => {
+    commit('已按比较规则重算差异，受影响的确认回到待复核', () => {
+      const touched = new Set<string>();
       rows.value = rows.value.map((row) => {
         if (!row.left || !row.right) return row;
         const score = Number(
           similarity(normalized(row.left.text, rules.value), normalized(row.right.text, rules.value)).toFixed(3)
         );
+        if (score !== row.similarity) touched.add(row.id);
         return { ...row, similarity: score, status: statusFor(row.left, row.right, score) };
       });
-      selectedRowIds.value = [];
+      // 规则变化本身会触发所有有效确认待复核
+      Object.keys(confirmations.value).forEach((id) => touched.add(id));
+      refreshConfirmationStates(touched);
     });
   }
 
   function updateRow(id: string, patch: Partial<AlignmentRow>) {
-    commit('已更新校勘行', () => {
+    commit('已更新校勘行，相关确认已回到待复核', () => {
       const row = rows.value.find((item) => item.id === id);
-      if (row) Object.assign(row, patch, { manuallyAdjusted: true });
+      if (!row) return;
+      Object.assign(row, patch, { manuallyAdjusted: true });
+      refreshConfirmationStates(new Set([id]));
     });
   }
 
   function shiftPairing(id: string, direction: -1 | 1) {
-    commit(direction < 0 ? '已向前调整错位' : '已向后调整错位', () => {
+    commit(direction < 0 ? '已向前调整配对，相关确认回到待复核' : '已向后调整配对，相关确认回到待复核', () => {
       const index = rows.value.findIndex((row) => row.id === id);
       const targetIndex = index + direction;
       if (index < 0 || targetIndex < 0 || targetIndex >= rows.value.length) return;
@@ -310,11 +493,12 @@ export function useCollation() {
         }
         row.manuallyAdjusted = true;
       }
+      refreshConfirmationStates(new Set([current.id, target.id]));
     });
   }
 
   function moveRow(id: string, direction: -1 | 1) {
-    commit('已移动校勘顺序', () => {
+    commit('已移动校勘行顺序', () => {
       const index = rows.value.findIndex((row) => row.id === id);
       const targetIndex = index + direction;
       if (index < 0 || targetIndex < 0 || targetIndex >= rows.value.length) return;
@@ -324,23 +508,84 @@ export function useCollation() {
     });
   }
 
-  function acceptRows(ids: string[]) {
-    if (!ids.length) return;
-    commit(`已接受 ${ids.length} 条校对建议`, () => {
-      const selected = new Set(ids);
-      rows.value.forEach((row) => {
-        if (selected.has(row.id)) row.accepted = true;
-      });
-      selectedRowIds.value = [];
-    });
+  function buildConfirmation(row: AlignmentRow, basis: string): ConfirmationRecord {
+    return {
+      id: uid('confirm'),
+      rowId: row.id,
+      editor: editorName.value.trim(),
+      basis: basis.trim(),
+      confirmedAt: new Date().toISOString(),
+      leftSnapshot: { unitId: row.left?.id, text: row.left?.text ?? '' },
+      rightSnapshot: { unitId: row.right?.id, text: row.right?.text ?? '' },
+      statusSnapshot: row.status,
+      rulesSnapshot: { ...rules.value },
+      noteSnapshot: row.note,
+      sourceSnapshot: row.source,
+      state: 'valid',
+      reviewReasons: []
+    };
   }
 
-  function acceptAll() {
-    commit('已批量接受全部差异建议', () => {
-      rows.value.forEach((row) => {
-        row.accepted = true;
+  /** 确认一行：处理人与依据必填；旧档案作废保留 */
+  function confirmRow(rowId: string, basis: string): { ok: boolean; reason?: string } {
+    const row = rows.value.find((item) => item.id === rowId);
+    if (!row) return { ok: false, reason: '未找到对应行' };
+    if (!editorName.value.trim()) return { ok: false, reason: '请先填写处理人署名' };
+    if (!basis.trim()) return { ok: false, reason: '确认依据不能为空' };
+
+    commit(`已确认 ${row.left?.text?.slice(0, 8) ?? ''}… 一行`, () => {
+      row.basis = basis.trim();
+      const list = confirmations.value[row.id] ?? [];
+      list.forEach((item) => {
+        if (item.state !== 'invalidated') {
+          item.state = 'invalidated';
+          item.invalidatedAt = new Date().toISOString();
+        }
       });
-      selectedRowIds.value = [];
+      list.push(buildConfirmation(row, basis));
+      confirmations.value[row.id] = list;
+    });
+    return { ok: true };
+  }
+
+  /**
+   * 批量确认：只覆盖当前搜索结果（传入的候选行）中已写明依据的条目。
+   * 返回实际确认与因缺依据/缺署名而跳过的行。
+   */
+  function confirmRows(candidateIds: string[]): { confirmed: AlignmentRow[]; skipped: AlignmentRow[] } {
+    const candidates = new Set(candidateIds);
+    const targets = rows.value.filter((row) => candidates.has(row.id) && row.basis.trim());
+    const skipped = rows.value.filter((row) => candidates.has(row.id) && !row.basis.trim());
+    if (!editorName.value.trim()) {
+      return { confirmed: [], skipped: rows.value.filter((row) => candidates.has(row.id)) };
+    }
+    if (!targets.length) return { confirmed: [], skipped };
+
+    const nowIso = new Date().toISOString();
+    commit(`已批量确认 ${targets.length} 条写有依据的条目`, () => {
+      targets.forEach((row) => {
+        const list = confirmations.value[row.id] ?? [];
+        list.forEach((item) => {
+          if (item.state !== 'invalidated') {
+            item.state = 'invalidated';
+            item.invalidatedAt = nowIso;
+          }
+        });
+        list.push(buildConfirmation(row, row.basis));
+        confirmations.value[row.id] = list;
+      });
+    });
+    return { confirmed: targets, skipped };
+  }
+
+  /** 撤回确认：当前档案标记失效并保留 */
+  function withdrawConfirmation(rowId: string) {
+    commit('已撤回确认，旧记录保留备查', () => {
+      const list = confirmations.value[rowId];
+      const record = list?.[list.length - 1];
+      if (!record || record.state === 'invalidated') return;
+      record.state = 'invalidated';
+      record.invalidatedAt = new Date().toISOString();
     });
   }
 
@@ -349,14 +594,14 @@ export function useCollation() {
     for (let offset = 1; offset <= rows.value.length; offset += 1) {
       const index = (start + offset) % rows.value.length;
       const row = rows.value[index];
-      if (row && row.status !== 'same' && !row.accepted) {
-        selectedRowId.value = row.id;
-        message.value = `已跳到第 ${index + 1} 条未接受差异`;
-        persist();
-        return;
-      }
+      if (!row || row.status === 'same') continue;
+      if (activeConfirmation(row.id)?.state === 'valid') continue;
+      selectedRowId.value = row.id;
+      message.value = `已跳到第 ${index + 1} 条待复核/待处理差异`;
+      persist();
+      return;
     }
-    message.value = '没有更多未接受的差异';
+    message.value = '没有更多待复核或待处理的差异';
   }
 
   function addVersion(name: string, source: string, text: string) {
@@ -377,7 +622,11 @@ export function useCollation() {
   }
 
   function exportMarkdown() {
-    const changed = rows.value.filter((row) => row.status !== 'same' || row.note || row.source);
+    const exportable = rows.value.filter((row) => row.status !== 'same' || row.note || row.source || row.basis);
+    const stateLabel = (row: AlignmentRow) => {
+      const state = activeConfirmation(row.id)?.state;
+      return state === 'valid' ? '✅ 有效' : state === 'review' ? '⚠️ 待复核' : '⏳ 待处理';
+    };
     const lines = [
       '# 校勘记',
       '',
@@ -385,27 +634,103 @@ export function useCollation() {
       `- 参校本：${rightVersion.value?.name ?? '未选择'}`,
       `- 比较规则：${rules.value.ignorePunctuation ? '忽略标点；' : ''}${rules.value.ignoreVariants ? '忽略异体字；' : ''}保留正文。`,
       `- 导出时间：${new Date().toLocaleString('zh-CN')}`,
+      `- 确认统计：有效 ${validCount.value} 条 · 待复核 ${reviewCount.value} 条 · 待处理 ${unresolvedCount.value - reviewCount.value} 条`,
       '',
-      '| 序 | 类别 | 底本 | 参校本 | 校记 | 来源 | 状态 |',
-      '|---|---|---|---|---|---|---|'
+      '| 序 | 类别 | 底本 | 参校本 | 校记 | 来源 | 确认依据 | 处理人 | 确认时间 | 确认状态 |',
+      '|---|---|---|---|---|---|---|---|---|---|'
     ];
-    changed.forEach((row, index) => {
+    exportable.forEach((row, index) => {
       const cell = (value?: string) => (value ?? '').replaceAll('|', '\\|').replaceAll('\n', ' ');
+      const record = activeConfirmation(row.id);
       lines.push(
-        `| ${index + 1} | ${statusLabel(row.status)} | ${cell(row.left?.text)} | ${cell(row.right?.text)} | ${cell(row.note)} | ${cell(row.source)} | ${row.accepted ? '已接受' : '待处理'} |`
+        `| ${index + 1} | ${statusLabel(row.status)} | ${cell(row.left?.text)} | ${cell(row.right?.text)} | ${cell(row.note)} | ${cell(row.source)} | ${cell(row.basis)} | ${cell(record?.editor)} | ${record ? new Date(record.confirmedAt).toLocaleString('zh-CN') : ''} | ${stateLabel(row)} |`
       );
     });
-    lines.push('', `共 ${changed.length} 条校勘记录。`);
+    lines.push('', `共 ${exportable.length} 条校勘记录（不含完全相同且无校记者）。`);
+
+    const historyLines = renderInvalidatedHistory();
+    if (historyLines.length) {
+      lines.push('', '## 已失效 / 归档的确认记录', '', ...historyLines);
+    }
     return lines.join('\n');
   }
 
+  function renderInvalidatedHistory(): string[] {
+    const invalidated: ConfirmationRecord[] = [];
+    Object.values(confirmations.value).forEach((list) => {
+      list.forEach((item) => {
+        if (item.state === 'invalidated') invalidated.push(item);
+      });
+    });
+    const archived = archivedConfirmations.value;
+    if (!invalidated.length && !archived.length) return [];
+    const lines = [
+      '| 处理人 | 依据 | 确认时间 | 当时底本 | 当时参校本 | 状态 | 说明 |',
+      '|---|---|---|---|---|---|---|'
+    ];
+    const cell = (value?: string) => (value ?? '').replaceAll('|', '\\|').replaceAll('\n', ' ');
+    invalidated.forEach((item) => {
+      lines.push(
+        `| ${cell(item.editor)} | ${cell(item.basis)} | ${new Date(item.confirmedAt).toLocaleString('zh-CN')} | ${cell(item.leftSnapshot.text)} | ${cell(item.rightSnapshot.text)} | 已失效 | 被后续确认取代或撤回 |`
+      );
+    });
+    archived.forEach((item) => {
+      const label = item.state === 'review' ? '待复核（配对已消失）' : '已失效';
+      lines.push(
+        `| ${cell(item.editor)} | ${cell(item.basis)} | ${new Date(item.confirmedAt).toLocaleString('zh-CN')} | ${cell(item.leftSnapshot.text)} | ${cell(item.rightSnapshot.text)} | ${label} | 重新对齐后原配对不存在，记录归档 |`
+      );
+    });
+    return lines;
+  }
+
   function exportJson() {
+    const payloadRows = rows.value.map((row) => {
+      const record = activeConfirmation(row.id);
+      return {
+        ...row,
+        confirmation: record
+          ? {
+              id: record.id,
+              editor: record.editor,
+              basis: record.basis,
+              confirmedAt: record.confirmedAt,
+              state: record.state,
+              reviewReasons: record.reviewReasons,
+              reviewedAt: record.reviewedAt,
+              snapshot: {
+                left: record.leftSnapshot,
+                right: record.rightSnapshot,
+                status: record.statusSnapshot,
+                rules: record.rulesSnapshot,
+                note: record.noteSnapshot,
+                source: record.sourceSnapshot
+              }
+            }
+          : null
+      };
+    });
+    const invalidated: ConfirmationRecord[] = [];
+    Object.values(confirmations.value).forEach((list) => {
+      list.forEach((item) => {
+        if (item.state === 'invalidated') invalidated.push(item);
+      });
+    });
     return JSON.stringify(
       {
+        schema: 'collation-v2',
         left: leftVersion.value,
         right: rightVersion.value,
         rules: rules.value,
-        rows: rows.value,
+        editorName: editorName.value,
+        summary: {
+          rows: rows.value.length,
+          valid: validCount.value,
+          review: reviewCount.value,
+          pending: unresolvedCount.value - reviewCount.value
+        },
+        rows: payloadRows,
+        invalidatedConfirmations: invalidated,
+        archivedConfirmations: archivedConfirmations.value,
         exportedAt: new Date().toISOString()
       },
       null,
@@ -414,8 +739,10 @@ export function useCollation() {
   }
 
   onMounted(() => {
+    editorName.value = localStorage.getItem(EDITOR_STORAGE_KEY) ?? '';
     try {
-      const raw = localStorage.getItem(STORAGE_KEY);
+      // 优先读 v2 数据；旧版（v1）草稿存在另一个键下，读取后自动迁移
+      const raw = localStorage.getItem(STORAGE_KEY) ?? localStorage.getItem('sologsb-1023/multi-version-collation/v1');
       if (raw) {
         restore(raw);
         message.value = '已恢复浏览器中的校勘草稿';
@@ -435,6 +762,7 @@ export function useCollation() {
       if (!processing.value) persist();
     }
   );
+  watch(editorName, () => persist());
 
   return {
     versions,
@@ -443,27 +771,33 @@ export function useCollation() {
     rows,
     rules,
     selectedRowId,
-    selectedRowIds,
     processing,
     progress,
     message,
-    history,
-    future,
+    editorName,
+    confirmations,
+    archivedConfirmations,
     canUndo,
     canRedo,
     leftVersion,
     rightVersion,
     selectedRow,
     differenceCount,
-    acceptedCount,
+    validCount,
+    reviewCount,
     unresolvedCount,
+    activeConfirmation,
+    confirmationState,
+    refreshConfirmationStates,
+    restore,
     runAlignment,
     recalculate,
     updateRow,
     shiftPairing,
     moveRow,
-    acceptRows,
-    acceptAll,
+    confirmRow,
+    confirmRows,
+    withdrawConfirmation,
     nextDifference,
     addVersion,
     undo,
@@ -482,4 +816,19 @@ export function statusLabel(status: DifferenceStatus) {
     removed: '左侧删减',
     misaligned: '疑错位'
   }[status];
+}
+
+export function confirmationStateLabel(state: ConfirmationState) {
+  return { valid: '有效', review: '待复核', invalidated: '已失效' }[state];
+}
+
+export function reviewReasonLabel(reason: ReviewReason) {
+  return {
+    text: '两侧正文或配对已变化',
+    rules: '比较规则已变化',
+    annotation: '校记、来源或依据已变化',
+    manual: '旧版确认，处理人与依据待补录',
+    judgment: '差异判断类别已变化',
+    superseded: '原配对在重新对齐后消失'
+  }[reason];
 }

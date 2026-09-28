@@ -152,6 +152,67 @@ textarea {
   background: #e8f3ff !important;
 }
 
+.row-review {
+  box-shadow: inset 3px 0 0 #cb2634;
+}
+
+.confirm-card {
+  border: 1px solid #e5e6eb;
+  border-radius: 10px;
+  background: #f7f8fa;
+}
+
+.confirm-card.is-valid {
+  border-color: #7be188;
+  background: #f0fff5;
+}
+
+.confirm-card.is-review {
+  border-color: #fbaca3;
+  background: #fff7f6;
+}
+
+.confirm-meta {
+  color: #4e5969;
+  font-size: 13px;
+  line-height: 1.8;
+  word-break: break-all;
+}
+
+.review-box {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  color: #cb2634;
+  font-size: 12px;
+  line-height: 1.7;
+  background: #fff1f0;
+}
+
+.review-reason {
+  margin: 2px 0;
+}
+
+.snapshot-box {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: #fff;
+  color: #4e5969;
+  font-size: 12px;
+}
+
+.snapshot-box summary {
+  cursor: pointer;
+  color: #165dff;
+}
+
+.snapshot-label {
+  margin: 8px 0 4px;
+  color: #86909c;
+  font-size: 11px;
+}
+
 .virtual-table .arco-table-td {
   vertical-align: top;
 }
